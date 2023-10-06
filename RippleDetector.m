@@ -5,19 +5,27 @@ classdef RippleDetector < handle
         samplingRate = 1000;
         dataFilePrefix = 'CSC';
         
-        %all the parameters are from Staresina et al (and Zhang et al is identical)
-        minFreq = 80;
-        maxFreq = 100;
+        
+%         %all the parameters are from Staresina et al (and Zhang et al is identical)
+%         minFreq = 80;
+%         maxFreq = 100;
+        
+        %these parameters are from Sakon et al 
+        minFreq = 70;
+        maxFreq = 178;
         
         % ripple detection on MICRO channels - parameters as in Le Van
         % Quyen et al 2008
         % minFreq = 80;
         % maxFreq = 200;
         
+        rippleThresh; %empty by default but can be set ahead of time and that will be used instead of other methods
         RMSWindowDuration = 20; %ms
+        fitDistributionInsteadOfUsingPercentile = 1;
         rippleThreshPercentile = 99;
         minDurationAboveThresh = 38; %ms
         minNumOfExtreme = 3; %min number of peaks / troughs in a ripple event
+        minCorrelationToRaw = 0.7; %EM: added this; I now save these values, too. It seems that anything < .7 is reliably not a ripple and anything > .8 is reliably a ripples. But the range between .7 and .8 is gray and probably needs to be evaluated by hand.
         NPointsToAverage = 3;
         minPercNaNAllowed = 0.1;
         minDistBetweenRipples = 20; %ms
@@ -86,11 +94,14 @@ classdef RippleDetector < handle
         specStartPointRipSp = 500;
         freqRangeSpRip = [50:150];
         nBinsPolar = 18;
+        
+        makeDebuggingFigs = 0;
     end
     
     methods
         
-        function [rippleTimes, rippleStartEnd] = detectRipple(obj, data, sleepScoring, IIStimes, stim_times)
+        function [rippleTimes, rippleStartEnd,filteredData,rippleCorrVal,obj] = ...
+                detectRipple(obj, data, sleepScoring, IIStimes, stim_times,justGetThresh)
             
             % The method finds ripples based on Staresina et al (2015)
             % Input:
@@ -107,6 +118,14 @@ classdef RippleDetector < handle
             minDurationAboveThresh = obj.minDurationAboveThresh*obj.samplingRate/1000;
             minDistBetweenRipples = obj.minDistBetweenRipples*obj.samplingRate/1000;
             
+            % we'll use this function for evaluating whether a subset of a
+            % ripple is sufficiently correlated to the raw trace, even if
+            % the whole thing isn't
+            corrWidth = obj.samplingRate/20;
+            getCorr = @(x,y,st)corr(diff(reshape(x(st:min([st+corrWidth,length(x)])),[],1)),...
+                diff(reshape(y(st:min(st+corrWidth,length(x))),[],1)));
+            maxSubCorr = @(x,y)max(arrayfun(@(st)getCorr(x,y,st),1:floor(corrWidth/2):length(x)-corrWidth));
+            
             if nargin < 3
                 sleepScoring = [];
             end
@@ -121,9 +140,20 @@ classdef RippleDetector < handle
                 removeSTIM_artifacts = false;
             end
             
+            if ~exist('justGetThresh','var') || isempty(justGetThresh)
+                % if justGetThresh is true, this will stop before actually
+                % detecting the ripples. This is useful for if you want to
+                % set a common threshold among different channels or
+                % different experiments, but still want it based on the
+                % data.
+                justGetThresh = 0;
+            end
             
             %filter data to required range
             filteredData = obj.bandpass(data, obj.minFreq, obj.maxFreq);
+            freqWidth = 20; %obj.maxFreq-obj.minFreq;
+            lowFiltered = obj.bandpass(data,obj.minFreq-freqWidth,obj.minFreq);
+            highFiltered = obj.bandpass(data,obj.maxFreq,obj.maxFreq+freqWidth);
             
             % if sleepScoring is nonempty: leave only the
             % segments in which there was sleep at the desired stage for
@@ -182,29 +212,76 @@ classdef RippleDetector < handle
                 rmsSignal(iPoint) = rms(filteredData(iPoint:iPoint+RMSWindowDuration-1));
             end
             
+            if isempty(obj.rippleThresh)
+            if obj.fitDistributionInsteadOfUsingPercentile
+                [n edges] = histcounts(rmsSignal);
+                %                 [m,ind] = max(n);
+                %                 halfWidth = mean(edges(ind:ind+1)) - prctile(rmsSignal,1);
+                %                 rippleThresh = mean(edges(ind:ind+1)) + halfWidth;
+                
+                % this finds the height of the histogram at the 0.5th
+                % percentile and then finds the edge at which all the bins
+                % to the right are also smaller than that value.
+                smallValues = continuousRunsOfTrue(n < n(find(edges<prctile(rmsSignal,0.5),1,'last')));
+                rippleThresh = edges(smallValues(end,1));
+                p = sum(rmsSignal<rippleThresh)/length(rmsSignal);
+                fprintf('Using the distribution picked a thresh of %.2f, which is the %.2f perentile\n',...
+                    rippleThresh,p*100);
+%                 figure; ax = gca; histogram(rmsSignal); hold(ax, 'on'); 
+%                 plot(ax,rippleThresh*[1 1],get(gca,'ylim'),'r','linewidth',2);
+                1;
+            else
             %calculate the threshold as the rippleThreshPercentile
             %percentile of the rms signal
             rippleThresh = prctile(rmsSignal,obj.rippleThreshPercentile);
+            end
+            
+            obj.rippleThresh = rippleThresh;
+            else
+                rippleThresh = obj.rippleThresh;
+            end
+            if justGetThresh
+                rippleTimes=[];
+                rippleStartEnd=[];
+                filteredData=[];
+                rippleCorrVal=[];
+                return
+            end
             
             %find windows that pass the thresh
             didPassThresh = rmsSignal>=rippleThresh;
             
             %find segments that pass the threshold for a duration longer than the threshold:
             %minDurationAboveThresh milliseconds
-            rippleSegs = [];
-            ind = 1;
-            indRipple = 1;
-            while ind <= length(didPassThresh)-minDurationAboveThresh+1
-                if all(didPassThresh(ind:ind+minDurationAboveThresh-1))
-                    rippleSegs(indRipple,1) = ind;
-                    endSeg = ind+find(didPassThresh(ind:end)==0,1) - 2;
-                    rippleSegs(indRipple,2) = endSeg + RMSWindowDuration - 1;
-                    indRipple = indRipple+1;
-                    ind = endSeg+2;
-                else
-                    ind = ind+1;
+
+            if false % this block of code is original (by Maya & team). It is equivalent to the else block, but the else block runs much, much faster.
+                rippleSegs = [];
+                ind = 1;
+                indRipple = 1;
+                while ind <= length(didPassThresh)-minDurationAboveThresh+1
+                    if all(didPassThresh(ind:ind+minDurationAboveThresh-1))
+                        rippleSegs(indRipple,1) = ind;
+                        endSeg = ind+find(didPassThresh(ind:end)==0,1) - 2;
+                        if isempty(endSeg)
+                            rippleSegs(indRipple,2) = length(didPassThresh);
+                        else
+                            rippleSegs(indRipple,2) = endSeg + RMSWindowDuration - 1;
+                        end
+                        indRipple = indRipple+1;
+                        ind = endSeg+2;
+                    else
+                        ind = ind+1;
+                    end
+                end
+            else
+                rippleSegs = continuousRunsOfTrue(didPassThresh);
+                rippleSegs = rippleSegs(rippleSegs(:,2)-rippleSegs(:,1)>=minDurationAboveThresh,:);
+                rippleSegs(:,2) = rippleSegs(:,2)+RMSWindowDuration-1;
+                if ~isempty(rippleSegs) && rippleSegs(end,2)>length(didPassThresh)
+                    rippleSegs(end,2) = length(didPassThresh);
                 end
             end
+            
             
             %merge ripples who are close
             rippleSegsMerged = [];
@@ -233,33 +310,70 @@ classdef RippleDetector < handle
                 end
                 
                 rippleSegs = rippleSegsMerged;
-                %go over ripples and leave only those with minNumOfExtreme
-                %extremes in the raw data
+
                 
                 %smooth the data by averaging 3 consecutive points
+                
+                %the go over ripples and leave only those with minNumOfExtreme
+                %extremes in the raw data and that have
+                %high correlation to the raw data
+                
                 rippleTimes = [];
                 rippleStartEnd = [];
+                rippleCorrVal = [];
                 isRipple = false;
                 for iRipple = 1:size(rippleSegs,1)
-                    currRipple = data(rippleSegs(iRipple,1):rippleSegs(iRipple,2));
+                    currInds = rippleSegs(iRipple,1):rippleSegs(iRipple,2);
+                    currRipple = data(currInds);
+
                     %average ripple
                     if isnan(currRipple)/length(currRipple)>=obj.minPercNaNAllowed
                         continue;
                     end
-                    currRipple = movmean(currRipple, obj.NPointsToAverage);
+                    try
+                        currRipple = movmean(currRipple, obj.NPointsToAverage);
+                    catch
+                        currRipple = my_movmean(currRipple,obj.NPointsToAverage);
+                    end
+                    try
                     localMax = islocalmax(currRipple);
-                    if sum(localMax) >= obj.minNumOfExtreme
-                        isRipple = true;
-                    else
-                        localMin = islocalmin(currRipple);
-                        if sum(localMin) >= obj.minNumOfExtreme
-                            isRipple = true;
+                    localMin = islocalmin(currRipple);
+                    catch
+                        localMax = my_islocalmax(currRipple,0);
+                        localMin = my_islocalmin(currRipple,0);
+                    end
+                    isRipple = sum(localMax) >= obj.minNumOfExtreme || sum(localMin) >= obj.minNumOfExtreme;
+                    
+                    if isRipple
+                        currFilteredRipple = filteredData(currInds);
+                        currLowFilt = lowFiltered(currInds);
+                        currHighFilt = highFiltered(currInds);
+                        % look at the correlation betwee the ripple and the
+                        % filtered ripple. We actually do it on the diff of
+                        % the data, as that takes care of detrending the
+                        % raw data, since a ripple on top of a slope can
+                        % artificially decrease the correlation value.
+                        lowBandCorr = maxSubCorr(currRipple,currLowFilt); %corr(diff(currRipple(:)),diff(currLowFilt(:)));
+                        highBandCorr = maxSubCorr(currRipple,currHighFilt);% corr(diff(currRipple(:)),diff(currHighFilt(:)));
+                        rippleCorr = maxSubCorr(currRipple,currFilteredRipple); %corr(diff(currRipple(:)),diff(currFilteredRipple(:)));
+                        isRipple = rippleCorr > max([lowBandCorr, highBandCorr, obj.minCorrelationToRaw]);
+                        if obj.makeDebuggingFigs
+                            figure; subplot(2,2,[1,2]); hold on;
+                        wideInds = (currInds(1)-obj.samplingRate/2):(currInds(end)+obj.samplingRate/2);
+                        plot(wideInds,data(wideInds)); plot(wideInds,filteredData(wideInds));
+                        plot(currInds,currRipple,'linewidth',2); plot(currInds,currFilteredRipple,'linewidth',2);
+                        title(sprintf('Kept? %d (corr = %.2f; highBand = %.2f, lowBand = %.2f)',...
+                            double(isRipple),rippleCorr,highBandCorr,lowBandCorr))
+                        subplot(223); hold on;
+                        plot(currInds,currRipple,'linewidth',2); plot(currInds,currFilteredRipple,'linewidth',2);
+                        subplot(224); hold on;
+                        plot(currInds(1:end-1),diff(currRipple),'linewidth',2); plot(currInds(1:end-1),diff(currFilteredRipple),'linewidth',2);
+                        set(get(gcf,'children'),'fontsize',16)
                         end
                     end
                     
                     if isRipple
                         %find the location of the largest peak
-                        currFilteredRipple = filteredData(rippleSegs(iRipple,1):rippleSegs(iRipple,2));
                         [~,maxLoc] = max(currFilteredRipple);
                         %                     localMaxInds = find(localMax);
                         %                     absMaxInd = localMaxInds(maxLoc)+rippleSegs(iRipple,1)-1;
@@ -267,6 +381,7 @@ classdef RippleDetector < handle
                         %add it to the ripple indices list
                         rippleTimes(end+1) = absMaxInd;
                         rippleStartEnd(end+1,:) = rippleSegs(iRipple,:);
+                        rippleCorrVal(end+1) = rippleCorr;
                     end
                     
                     isRipple = false;
@@ -275,6 +390,7 @@ classdef RippleDetector < handle
                 
                 rippleTimes = [];
                 rippleStartEnd = [];
+                rippleCorrVal = [];
                 
             end
         end
